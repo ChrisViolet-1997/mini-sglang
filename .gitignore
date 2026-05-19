@@ -31,3 +31,7 @@ env/
 # .vscode
 .vscode/
 .coverage
+
+# prompt data (large files)
+input_prompt/
+input_prompt_demo/

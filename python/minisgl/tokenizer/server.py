@@ -38,6 +38,7 @@ def tokenize_worker(
     local_bs: int,
     tokenizer_id: int = -1,
     model_source: str = "huggingface",
+    page_size: int = 1,
     ack_queue: mp.Queue[str] | None = None,
 ) -> None:
     send_backend = ZmqPushQueue(backend_addr, create=False, encoder=BaseBackendMsg.encoder)
@@ -50,7 +51,7 @@ def tokenize_worker(
     from .detokenize import DetokenizeManager
     from .tokenize import TokenizeManager
 
-    tokenize_manager = TokenizeManager(tokenizer)
+    tokenize_manager = TokenizeManager(tokenizer, page_size=page_size)
     detokenize_manager = DetokenizeManager(tokenizer)
 
     if ack_queue is not None:
@@ -85,15 +86,16 @@ def tokenize_worker(
                 send_frontend.put(batch_output)
 
             if len(tokenize_msg) > 0:
-                tensors = tokenize_manager.tokenize(tokenize_msg)
+                results = tokenize_manager.tokenize(tokenize_msg)
                 batch_output = BatchBackendMsg(
                     data=[
                         UserMsg(
                             uid=msg.uid,
-                            input_ids=t,
+                            input_ids=ids,
                             sampling_params=msg.sampling_params,
+                            aliasing_guide=guide,
                         )
-                        for msg, t in zip(tokenize_msg, tensors, strict=True)
+                        for msg, (ids, guide) in zip(tokenize_msg, results, strict=True)
                     ]
                 )
                 if len(batch_output.data) == 1:

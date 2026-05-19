@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from minisgl.attention import BaseAttnBackend, BaseAttnMetadata
     from minisgl.kvcache import BaseCacheHandle, BaseKVCachePool
     from minisgl.moe import BaseMoeBackend
+    from minisgl.tokenizer.aliasing import AliasingGuideTable
 
 
 @dataclass
@@ -34,6 +35,7 @@ class Req:
     uid: int
     sampling_params: SamplingParams
     cache_handle: BaseCacheHandle
+    aliasing_guide: AliasingGuideTable | None = None
 
     def __post_init__(self) -> None:
         assert self.input_ids.is_cpu

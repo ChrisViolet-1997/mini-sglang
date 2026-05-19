@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List
 
 import torch
 from minisgl.core import SamplingParams
+from minisgl.tokenizer.aliasing import AliasEntry, AliasingGuideTable
 
 from .utils import deserialize_type, serialize_type
 
@@ -34,6 +35,7 @@ class UserMsg(BaseBackendMsg):
     uid: int
     input_ids: torch.Tensor  # CPU 1D int32 tensor
     sampling_params: SamplingParams
+    aliasing_guide: AliasingGuideTable = field(default_factory=AliasingGuideTable)
 
 
 @dataclass

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List
 
 import torch
 
 if TYPE_CHECKING:
     from minisgl.core import SamplingParams
+    from minisgl.tokenizer.aliasing import AliasingGuideTable
 
     from .prefill import ChunkedReq
 
@@ -17,6 +18,7 @@ class PendingReq:
     input_ids: torch.Tensor
     sampling_params: SamplingParams
     chunked_req: ChunkedReq | None = None
+    aliasing_guide: AliasingGuideTable | None = None
 
     @property
     def input_len(self) -> int:

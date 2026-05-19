@@ -96,6 +96,7 @@ def launch_server(run_shell: bool = False) -> None:
                     "local_bs": 1,
                     "create": server_args.tokenizer_create_addr,
                     "tokenizer_id": i,
+                    "page_size": server_args.page_size,
                     "ack_queue": ack_queue,
                 },
                 daemon=False,
