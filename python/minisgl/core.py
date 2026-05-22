@@ -10,6 +10,7 @@ if TYPE_CHECKING:
     from minisgl.attention import BaseAttnBackend, BaseAttnMetadata
     from minisgl.kvcache import BaseCacheHandle, BaseKVCachePool
     from minisgl.moe import BaseMoeBackend
+    from minisgl.scheduler.flash_forward import FlashForwardState
     from minisgl.tokenizer.aliasing import AliasingGuideTable
 
 
@@ -42,6 +43,8 @@ class Req:
         self.device_len = len(self.input_ids)
         self.max_device_len = len(self.input_ids) + self.output_len
         assert 0 <= self.cached_len < self.device_len <= self.max_device_len
+        self._skip_suffix_len: int = 0
+        self._ff_state: FlashForwardState | None = None
 
     @property
     def remain_len(self) -> int:
@@ -50,6 +53,11 @@ class Req:
     @property
     def extend_len(self) -> int:
         return self.device_len - self.cached_len
+
+    @property
+    def forward_extend_len(self) -> int:
+        """Tokens to forward in pass 1 (excludes skipped dst suffix)."""
+        return self.extend_len - self._skip_suffix_len
 
     def complete_one(self) -> None:
         self.cached_len = self.device_len

@@ -18,7 +18,14 @@ from minisgl.utils import init_logger, load_tokenizer
 from .cache import CacheManager
 from .config import SchedulerConfig
 from .decode import DecodeManager
+from .flash_forward import (
+    FlashForwardDetector,
+    FlashForwardState,
+    build_flash_forward_candidates,
+    execute_flash_forward,
+)
 from .io import SchedulerIOMixin
+from .kv_alias import apply_kv_aliasing, compute_skippable_suffix
 from .prefill import ChunkedReq, PrefillManager
 from .table import TableManager
 
@@ -70,7 +77,14 @@ class Scheduler(SchedulerIOMixin):
         self.eos_token_id = self.tokenizer.eos_token_id
         self.token_pool = self.table_manager.token_pool
         self.prefill_budget = config.max_extend_tokens
+        self.page_size = config.page_size
         # self.config = config
+
+        # Retrieve cos_sin_cache for KV aliasing RoPE correction
+        self._cos_sin_cache = self._get_cos_sin_cache(config)
+
+        # Flash-forward detector for decode-time fast-forwarding
+        self.ff_detector = FlashForwardDetector()
 
         # Initialize the I/O mixin
         super().__init__(config, self.engine.tp_cpu_group)
@@ -79,6 +93,24 @@ class Scheduler(SchedulerIOMixin):
         """Called when the scheduler is idle to perform background tasks."""
         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
         self.cache_manager.check_integrity()
+
+    @staticmethod
+    def _get_cos_sin_cache(config: SchedulerConfig) -> torch.Tensor:
+        """Retrieve the precomputed cos_sin_cache from the rotary embedding layer."""
+        from minisgl.layers.rotary import get_rope
+
+        rc = config.model_config.rotary_config
+        rope = get_rope(
+            head_dim=rc.head_dim,
+            rotary_dim=rc.rotary_dim,
+            max_position=rc.max_position,
+            base=rc.base,
+            rope_scaling=tuple(rc.scaling.items()) if rc.scaling else None,
+        )
+        cache = rope._cos_sin_cache
+        if not cache.is_cuda:
+            cache = cache.to(torch.device(f"cuda:{config.tp_info.rank}"))
+        return cache
 
     def overlap_loop(self, last_data: ForwardData | None) -> ForwardData | None:
         """
@@ -162,6 +194,48 @@ class Scheduler(SchedulerIOMixin):
                     new_finished_reqs.add(req)
                 elif batch.is_prefill:  # for prefill, non-chunk req, cache the prefix
                     self.cache_manager.cache_req(req, finished=False)
+                    # Post-prefill: initialize flash-forward state
+                    if req.aliasing_guide and not req.aliasing_guide.empty:
+                        candidates = build_flash_forward_candidates(
+                            req.input_ids, req.aliasing_guide, self.page_size
+                        )
+                        if candidates:
+                            req._ff_state = FlashForwardState(candidates=candidates)
+                elif not finished and req._ff_state is not None:
+                    # Decode phase: check for flash-forward trigger
+                    self.ff_detector.feed_token(req._ff_state, next_token)
+                    ff_tokens = self.ff_detector.get_fast_forward_tokens(req._ff_state)
+                    if ff_tokens is not None and len(ff_tokens) > 0:
+                        # Clamp to remain_len
+                        ff_tokens = ff_tokens[: req.remain_len]
+                        if len(ff_tokens) > 0:
+                            cand = req._ff_state.candidates[req._ff_state.active_candidate_idx]
+                            ff_msgs = execute_flash_forward(
+                                req=req,
+                                ff_tokens=ff_tokens,
+                                src_start_pos=cand.src_start_pos,
+                                matched_count=req._ff_state.matched_count,
+                                token_pool=self.token_pool,
+                                page_table=self.engine.page_table,
+                                kv_cache=self.engine.kv_cache,
+                                cos_sin_cache=self._cos_sin_cache,
+                                cache_manager=self.cache_manager,
+                                page_size=self.page_size,
+                            )
+                            reply.extend(ff_msgs)
+                            req._ff_state.reset()
+                            # Re-check finish after fast-forward
+                            if not req.can_decode:
+                                self.decode_manager.remove_req(req)
+                                self._free_req_resources(req)
+                                new_finished_reqs.add(req)
+                                # Mark last ff msg as finished
+                                if ff_msgs:
+                                    ff_msgs[-1] = DetokenizeMsg(
+                                        uid=req.uid,
+                                        next_token=ff_msgs[-1].next_token,
+                                        finished=True,
+                                    )
 
         self.finished_reqs = new_finished_reqs
         self.send_result(reply)
@@ -204,6 +278,9 @@ class Scheduler(SchedulerIOMixin):
     def _prepare_batch(self, batch: Batch) -> ForwardInput:
         self.engine.graph_runner.pad_batch(batch)
         self.cache_manager.allocate_paged(batch.reqs)
+        if batch.is_prefill:
+            for req in batch.reqs:
+                req._skip_suffix_len = compute_skippable_suffix(req, self.page_size)
         batch.positions = _make_positions(batch, self.device)
         input_mapping = _make_input_tuple(batch, self.device)
         write_mapping = _make_write_tuple(batch, self.device)
@@ -226,22 +303,83 @@ class Scheduler(SchedulerIOMixin):
 
     def _forward(self, forward_input: ForwardInput) -> ForwardOutput:
         batch, sample_args, input_mapping, output_mapping = forward_input
+        has_skip = batch.is_prefill and any(
+            r._skip_suffix_len > 0 for r in batch.reqs
+        )
+
+        if not has_skip:
+            # V1 path: single forward + post-copy
+            batch.input_ids = self.token_pool[input_mapping]
+            forward_output = self.engine.forward_batch(batch, sample_args)
+            self.token_pool[output_mapping] = forward_output.next_tokens_gpu
+            if batch.is_prefill:
+                apply_kv_aliasing(
+                    batch, self.engine.kv_cache, self.engine.page_table,
+                    self._cos_sin_cache, self.page_size,
+                )
+            self.decode_manager.filter_reqs(forward_input.batch.reqs)
+            return forward_output
+        else:
+            # V1.1 two-pass path
+            return self._forward_two_pass(forward_input)
+
+    def _forward_two_pass(self, forward_input: ForwardInput) -> ForwardOutput:
+        """Two-pass forward: pass 1 (bulk non-dst), KV copy, pass 2 (last token)."""
+        batch, sample_args, input_mapping, output_mapping = forward_input
+
+        # --- Pass 1: forward non-dst extend tokens ---
         batch.input_ids = self.token_pool[input_mapping]
+        with self.engine.ctx.forward_batch(batch):
+            self.engine.model.forward()
+
+        # --- KV Copy: fill dst positions from src ---
+        apply_kv_aliasing(
+            batch, self.engine.kv_cache, self.engine.page_table,
+            self._cos_sin_cache, self.page_size,
+        )
+
+        # --- Pass 2: forward last token per request with full context ---
+        self._prepare_pass2(batch)
         forward_output = self.engine.forward_batch(batch, sample_args)
         self.token_pool[output_mapping] = forward_output.next_tokens_gpu
         self.decode_manager.filter_reqs(forward_input.batch.reqs)
         return forward_output
 
+    def _prepare_pass2(self, batch: Batch) -> None:
+        """Rebuild batch metadata for pass 2: one token per request with full context."""
+        page_table = self.engine.page_table
+        device = self.device
+
+        # Positions: last position (device_len - 1) for each real req
+        positions_list = []
+        input_ids_list = []
+        out_loc_list = []
+
+        for req in batch.padded_reqs:
+            last_pos = req.device_len - 1
+            positions_list.append(last_pos)
+            input_ids_list.append(self.token_pool[req.table_idx, last_pos])
+            out_loc_list.append(int(page_table[req.table_idx, last_pos].item()))
+
+        batch.positions = torch.tensor(
+            positions_list, dtype=torch.int32, device=device
+        )
+        batch.input_ids = torch.stack(input_ids_list)
+        batch.out_loc = torch.tensor(out_loc_list, dtype=torch.int32, device=device)
+
+        # Prepare decode-like metadata with full context
+        self.engine.attn_backend.prepare_metadata_pass2(batch)
+
 
 def _make_positions(batch: Batch, device: torch.device) -> torch.Tensor:
-    needed_size = sum(r.extend_len for r in batch.padded_reqs)
+    needed_size = sum(r.forward_extend_len for r in batch.padded_reqs)
     indices_host = torch.empty(needed_size, dtype=torch.int32, pin_memory=True)
     offset = 0
     for req in batch.padded_reqs:
-        length = req.extend_len
+        length = req.forward_extend_len
         torch.arange(
             req.cached_len,
-            req.device_len,
+            req.cached_len + length,
             dtype=torch.int32,
             out=indices_host[offset : offset + length],
         )
@@ -253,7 +391,7 @@ def _make_input_tuple(batch: Batch, device: torch.device) -> Indice2D:
     mapping_host = torch.empty(len(batch.positions), dtype=torch.int64, pin_memory=True)
     offset = 0
     for req in batch.padded_reqs:
-        length = req.extend_len
+        length = req.forward_extend_len
         mapping_host[offset : offset + length].fill_(req.table_idx)
         offset += length
     return mapping_host.to(device, non_blocking=True), batch.positions.to(torch.int64)

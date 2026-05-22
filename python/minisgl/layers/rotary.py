@@ -32,9 +32,46 @@ class RotaryEmbedding(StateLessOP):
         self._cos_sin_cache = torch.cat((cos, sin), dim=-1)
         assert self.head_size in [64, 128, 256, 512]
 
-        from flashinfer import apply_rope_with_cos_sin_cache_inplace
+        self._use_flashinfer_rope = self._can_use_flashinfer_rope()
+        if self._use_flashinfer_rope:
+            from flashinfer import apply_rope_with_cos_sin_cache_inplace
+            self.apply_rope_with_cos_sin_cache_inplace = apply_rope_with_cos_sin_cache_inplace
 
-        self.apply_rope_with_cos_sin_cache_inplace = apply_rope_with_cos_sin_cache_inplace
+    @staticmethod
+    def _can_use_flashinfer_rope() -> bool:
+        if not torch.cuda.is_available():
+            return False
+        cap = torch.cuda.get_device_capability()
+        return cap[0] > 7 or (cap[0] == 7 and cap[1] >= 5)
+
+    def _torch_rope_inplace(
+        self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pure PyTorch RoPE fallback."""
+        half_dim = self.head_size // 2
+        cos_sin = self._cos_sin_cache[positions.long()]  # [num_tokens, head_size]
+        cos = cos_sin[:, :half_dim]  # [num_tokens, half_dim]
+        sin = cos_sin[:, half_dim:]  # [num_tokens, half_dim]
+
+        # query: [num_tokens, num_heads * head_size]
+        num_q_heads = query.shape[-1] // self.head_size
+        num_k_heads = key.shape[-1] // self.head_size
+
+        def apply_rope(x, num_heads):
+            x = x.view(-1, num_heads, self.head_size)
+            x1 = x[..., :half_dim]
+            x2 = x[..., half_dim:]
+            cos_exp = cos.unsqueeze(1).expand_as(x1)
+            sin_exp = sin.unsqueeze(1).expand_as(x1)
+            out1 = x1 * cos_exp - x2 * sin_exp
+            out2 = x2 * cos_exp + x1 * sin_exp
+            return torch.cat([out1, out2], dim=-1).view(-1, num_heads * self.head_size)
+
+        query_out = apply_rope(query, num_q_heads)
+        key_out = apply_rope(key, num_k_heads)
+        query.copy_(query_out)
+        key.copy_(key_out)
+        return query, key
 
     def forward(
         self,
@@ -42,14 +79,16 @@ class RotaryEmbedding(StateLessOP):
         query: torch.Tensor,
         key: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        self.apply_rope_with_cos_sin_cache_inplace(
-            positions=positions,
-            query=query,
-            key=key,
-            head_size=self.head_size,
-            cos_sin_cache=self._cos_sin_cache,
-        )
-        return query, key
+        if self._use_flashinfer_rope:
+            self.apply_rope_with_cos_sin_cache_inplace(
+                positions=positions,
+                query=query,
+                key=key,
+                head_size=self.head_size,
+                cos_sin_cache=self._cos_sin_cache,
+            )
+            return query, key
+        return self._torch_rope_inplace(positions, query, key)
 
 
 def _get_rope(
