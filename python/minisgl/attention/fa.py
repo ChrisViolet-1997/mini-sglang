@@ -154,29 +154,54 @@ def _fa_sgl_impl(
     pack_gqa: bool | None = None,  # Can be tuned for speed
     causal: bool = True,
 ) -> torch.Tensor:
-    try:
-        from sgl_kernel.flash_attn import flash_attn_with_kvcache
-    except ImportError as e:
-        raise ImportError(
-            "sgl_kernel.flash_attn is not found. Please install it with `pip install sgl-kernel`.\n"
-            "If you're sure it's correctly installed, try `apt update && apt install libnuma1`."
-        ) from e
+    from flash_attn import flash_attn_varlen_func
 
-    return flash_attn_with_kvcache(  # type: ignore
+    # k_cache/v_cache shape: (num_pages, page_size, kv_heads, head_dim)
+    # page_table shape: (batch_size, max_pages_per_seq)
+    # With page_size=1, each page is one token.
+    # Gather contiguous KV from paged cache using page_table and cache_seqlens.
+    page_size = k_cache.shape[1]
+    batch_size = page_table.shape[0]
+    max_seqlen_k = int(cu_seqlens_k[-1] - cu_seqlens_k[-2])  # last seq's k len
+    # Recompute max_seqlen_k from cache_seqlens for correctness
+    max_seqlen_k = int(cache_seqlens.max().item())
+
+    # Build flat indices from page_table: for each seq, take first cache_seqlens[i] pages
+    # page_table[i, j] gives the physical page index for seq i, logical position j
+    indices_list = []
+    for i in range(batch_size):
+        seq_len = int(cache_seqlens[i].item())
+        num_pages_needed = (seq_len + page_size - 1) // page_size
+        page_indices = page_table[i, :num_pages_needed]  # (num_pages_needed,)
+        if page_size == 1:
+            indices_list.append(page_indices)
+        else:
+            # Expand page indices to token-level indices
+            offsets = torch.arange(page_size, device=page_table.device)
+            expanded = page_indices.unsqueeze(1) * page_size + offsets.unsqueeze(0)
+            indices_list.append(expanded.reshape(-1)[:seq_len])
+
+    flat_indices = torch.cat(indices_list)  # (total_k,)
+
+    # Gather KV: k_cache is (num_pages, page_size, kv_heads, head_dim)
+    # Flatten to (num_pages * page_size, kv_heads, head_dim) then index
+    kv_heads = k_cache.shape[2]
+    head_dim = k_cache.shape[3]
+    k_flat = k_cache.reshape(-1, kv_heads, head_dim)  # (total_slots, kv_heads, head_dim)
+    v_flat = v_cache.reshape(-1, kv_heads, head_dim)
+    k_gathered = k_flat[flat_indices]  # (total_k, kv_heads, head_dim)
+    v_gathered = v_flat[flat_indices]
+
+    return flash_attn_varlen_func(
         q=q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        page_table=page_table,
-        cache_seqlens=cache_seqlens,
+        k=k_gathered,
+        v=v_gathered,
         cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k_new=cu_seqlens_k,
+        cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
         softmax_scale=softmax_scale,
-        sm_margin=sm_margin,
+        causal=causal,
         window_size=window_size,
         softcap=softcap,
-        num_splits=num_splits,
-        pack_gqa=pack_gqa,
-        causal=causal,
-        ver=version,  # TODO: support FA4 on blackwell
     )

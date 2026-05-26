@@ -41,8 +41,15 @@ class RotaryEmbedding(StateLessOP):
     def _can_use_flashinfer_rope() -> bool:
         if not torch.cuda.is_available():
             return False
-        cap = torch.cuda.get_device_capability()
-        return cap[0] > 7 or (cap[0] == 7 and cap[1] >= 5)
+        try:
+            import flashinfer.jit.core as core
+            # flashinfer JIT requires detected CUDA archs; sm120 is not yet supported
+            if not core.current_compilation_context.TARGET_CUDA_ARCHS:
+                return False
+            from flashinfer import apply_rope_with_cos_sin_cache_inplace
+            return True
+        except (ImportError, RuntimeError):
+            return False
 
     def _torch_rope_inplace(
         self, positions: torch.Tensor, query: torch.Tensor, key: torch.Tensor
