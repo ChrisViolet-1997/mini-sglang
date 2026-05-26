@@ -191,8 +191,9 @@ class FlashInferBackend(BaseAttnBackend):
         reqs = batch.padded_reqs
 
         padded_size = len(reqs)
-        seqlens_q = [req.extend_len for req in reqs]
-        seqlens_k = [req.device_len for req in reqs]
+        seqlens_q = [req.forward_extend_len for req in reqs]
+        # Use cached_len + forward_extend_len as effective KV length (excludes skipped suffix)
+        seqlens_k = [req.cached_len + req.forward_extend_len for req in reqs]
         cached_lens = [req.cached_len for req in reqs]
         max_seqlen_q = max(seqlens_q)
         CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
@@ -212,7 +213,7 @@ class FlashInferBackend(BaseAttnBackend):
             cu_seqlens_q_cpu=cu_seqlens_q_cpu,
             cu_seqlens_k_cpu=cu_seqlens_k_cpu,
             cu_seqlens_q_gpu=cu_seqlens_q_cpu.to(device, non_blocking=True),
-            indices=torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs]),
+            indices=torch.cat([page_table[req.table_idx, : req.cached_len + req.forward_extend_len] for req in reqs]),
             last_page_len_cpu=self._get_ones_cpu(padded_size),
             num_qo_heads=self.qo_head_local,
             num_kv_heads=self.kv_head_local,
@@ -222,6 +223,36 @@ class FlashInferBackend(BaseAttnBackend):
             seq_lens_cpu=seq_len_cpu,
             dtype=self.kvcache.dtype,
             wrapper=self.decode_wrappers if batch.is_decode else self.prefill_wrapper,
+        )
+
+    def prepare_metadata_pass2(self, batch: Batch) -> None:
+        """Prepare decode-like metadata for pass 2: 1 token per request with full KV context."""
+        reqs = batch.padded_reqs
+        padded_size = len(reqs)
+        CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
+        device = self.device
+
+        # Pass 2: each request forwards 1 token with full device_len context
+        seqlens_k = [req.device_len for req in reqs]
+        seq_len_cpu = torch.tensor(seqlens_k, **CPU_KWARGS)
+        cu_seqlens_k_cpu = torch.tensor([0] + seqlens_k, **CPU_KWARGS).cumsum_(dim=0)
+        cu_seqlens_q_cpu = torch.arange(0, padded_size + 1, **CPU_KWARGS)
+
+        page_table = get_global_ctx().page_table
+        batch.attn_metadata = FIMetadata(
+            cu_seqlens_q_cpu=cu_seqlens_q_cpu,
+            cu_seqlens_k_cpu=cu_seqlens_k_cpu,
+            cu_seqlens_q_gpu=cu_seqlens_q_cpu.to(device, non_blocking=True),
+            indices=torch.cat([page_table[req.table_idx, : req.device_len] for req in reqs]),
+            last_page_len_cpu=self._get_ones_cpu(padded_size),
+            num_qo_heads=self.qo_head_local,
+            num_kv_heads=self.kv_head_local,
+            head_dim=self.config.head_dim,
+            page_size=1,
+            pos_encoding_mode="NONE",
+            seq_lens_cpu=seq_len_cpu,
+            dtype=self.kvcache.dtype,
+            wrapper=self.prefill_wrapper,  # use prefill wrapper for varlen (1 q per req)
         )
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:

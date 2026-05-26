@@ -60,6 +60,7 @@ class FlashAttentionBackend(BaseAttnBackend):
             cu_seqlens_q=metadata.cu_seqlens_q,
             cu_seqlens_k=metadata.cu_seqlens_k,
             max_seqlen_q=metadata.max_seqlen_q,
+            max_seqlen_k=metadata.max_seqlen_k,
             softmax_scale=self.scale,
             version=self.version,
         )
@@ -68,8 +69,9 @@ class FlashAttentionBackend(BaseAttnBackend):
         reqs = batch.padded_reqs
 
         padded_size = len(reqs)
-        seqlens_q = [req.extend_len for req in reqs]
-        seqlens_k = [req.device_len for req in reqs]
+        seqlens_q = [req.forward_extend_len for req in reqs]
+        # Use cached_len + forward_extend_len as effective KV length (excludes skipped suffix)
+        seqlens_k = [req.cached_len + req.forward_extend_len for req in reqs]
         cached_lens = [req.cached_len for req in reqs]
         max_seqlen_k = max(seqlens_k)
         max_seqlen_q = max(seqlens_q)
@@ -101,6 +103,35 @@ class FlashAttentionBackend(BaseAttnBackend):
             cache_seqlens=cache_seqlens,
             max_seqlen_k=max_seqlen_k,
             max_seqlen_q=max_seqlen_q,
+            page_table=new_page_table,
+        )
+
+    def prepare_metadata_pass2(self, batch: Batch) -> None:
+        """Prepare decode-like metadata for pass 2: 1 token per request with full KV context."""
+        reqs = batch.padded_reqs
+        padded_size = len(reqs)
+        CPU_KWARGS = {"device": "cpu", "dtype": torch.int32, "pin_memory": True}
+        device = self.kvcache.device
+
+        # Pass 2: each request forwards 1 token with full device_len context
+        seqlens_k = [req.device_len for req in reqs]
+        max_seqlen_k = max(seqlens_k)
+        cache_seqlens = torch.tensor(seqlens_k, **CPU_KWARGS).to(device, non_blocking=True)
+        cu_seqlens_k = torch.tensor([0] + seqlens_k, **CPU_KWARGS).cumsum_(dim=0).to(device, non_blocking=True)
+        cu_seqlens_q = torch.arange(0, padded_size + 1, device=device, dtype=torch.int32)
+
+        page_table = get_global_ctx().page_table
+        new_page_table = torch.stack(
+            [page_table[req.table_idx, : max_seqlen_k : self.page_size] for req in reqs]
+        )
+        if self.page_size > 1:
+            new_page_table.div_(self.page_size, rounding_mode="floor")
+        batch.attn_metadata = FAMetadata(
+            cu_seqlens_k=cu_seqlens_k,
+            cu_seqlens_q=cu_seqlens_q,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=max_seqlen_k,
+            max_seqlen_q=1,
             page_table=new_page_table,
         )
 
@@ -145,6 +176,7 @@ def _fa_sgl_impl(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     max_seqlen_q: int,
+    max_seqlen_k: int,
     softmax_scale: float,
     version: int,
     sm_margin: int = 0,
@@ -158,38 +190,34 @@ def _fa_sgl_impl(
 
     # k_cache/v_cache shape: (num_pages, page_size, kv_heads, head_dim)
     # page_table shape: (batch_size, max_pages_per_seq)
-    # With page_size=1, each page is one token.
-    # Gather contiguous KV from paged cache using page_table and cache_seqlens.
     page_size = k_cache.shape[1]
     batch_size = page_table.shape[0]
-    max_seqlen_k = int(cu_seqlens_k[-1] - cu_seqlens_k[-2])  # last seq's k len
-    # Recompute max_seqlen_k from cache_seqlens for correctness
-    max_seqlen_k = int(cache_seqlens.max().item())
+    max_pages = page_table.shape[1]
 
-    # Build flat indices from page_table: for each seq, take first cache_seqlens[i] pages
-    # page_table[i, j] gives the physical page index for seq i, logical position j
-    indices_list = []
-    for i in range(batch_size):
-        seq_len = int(cache_seqlens[i].item())
-        num_pages_needed = (seq_len + page_size - 1) // page_size
-        page_indices = page_table[i, :num_pages_needed]  # (num_pages_needed,)
-        if page_size == 1:
-            indices_list.append(page_indices)
+    # Build flat_indices from page_table
+    if page_size == 1:
+        if max_seqlen_q == 1:
+            # Decode path (CUDA graph compatible): all seqs padded to max_seqlen_k
+            # page_table shape is (batch, max_seqlen_k) from prepare_for_capture/replay
+            # cu_seqlens_k defines actual boundaries within the gathered KV
+            flat_indices = page_table[:, :max_seqlen_k].reshape(-1)
         else:
-            # Expand page indices to token-level indices
-            offsets = torch.arange(page_size, device=page_table.device)
-            expanded = page_indices.unsqueeze(1) * page_size + offsets.unsqueeze(0)
-            indices_list.append(expanded.reshape(-1)[:seq_len])
+            # Prefill path: use boolean mask (not in CUDA graph)
+            arange = torch.arange(max_pages, device=page_table.device)
+            mask = arange.unsqueeze(0) < cache_seqlens.unsqueeze(1)
+            flat_indices = page_table[mask]
+    else:
+        # General case (not used in CUDA graph path)
+        arange = torch.arange(max_pages, device=page_table.device)
+        mask = arange.unsqueeze(0) < cache_seqlens.unsqueeze(1)
+        flat_indices = page_table[mask]
 
-    flat_indices = torch.cat(indices_list)  # (total_k,)
-
-    # Gather KV: k_cache is (num_pages, page_size, kv_heads, head_dim)
-    # Flatten to (num_pages * page_size, kv_heads, head_dim) then index
+    # Gather KV
     kv_heads = k_cache.shape[2]
     head_dim = k_cache.shape[3]
-    k_flat = k_cache.reshape(-1, kv_heads, head_dim)  # (total_slots, kv_heads, head_dim)
+    k_flat = k_cache.reshape(-1, kv_heads, head_dim)
     v_flat = v_cache.reshape(-1, kv_heads, head_dim)
-    k_gathered = k_flat[flat_indices]  # (total_k, kv_heads, head_dim)
+    k_gathered = k_flat[flat_indices]
     v_gathered = v_flat[flat_indices]
 
     return flash_attn_varlen_func(

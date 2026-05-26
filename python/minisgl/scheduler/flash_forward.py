@@ -44,6 +44,17 @@ class FlashForwardState:
     # Active matching state
     active_candidate_idx: int = -1
     matched_count: int = 0
+    # First-token index for O(1) lookup
+    first_token_map: dict = field(default_factory=dict)
+
+    def __post_init__(self):
+        # Build index: first_token -> list of candidate indices
+        self.first_token_map = {}
+        for idx, cand in enumerate(self.candidates):
+            tok = cand.token_list[0]
+            if tok not in self.first_token_map:
+                self.first_token_map[tok] = []
+            self.first_token_map[tok].append(idx)
 
     def reset(self) -> None:
         self.active_candidate_idx = -1
@@ -66,12 +77,11 @@ class FlashForwardDetector:
                 state.active_candidate_idx = -1
                 state.matched_count = 0
 
-        # Try to start a new match with any candidate
-        for idx, cand in enumerate(state.candidates):
-            if cand.token_list[0] == token_id:
-                state.active_candidate_idx = idx
-                state.matched_count = 1
-                return
+        # Try to start a new match using first-token index (O(1) lookup)
+        candidate_indices = state.first_token_map.get(token_id)
+        if candidate_indices:
+            state.active_candidate_idx = candidate_indices[0]
+            state.matched_count = 1
 
     def get_fast_forward_tokens(self, state: FlashForwardState) -> Optional[torch.Tensor]:
         """
@@ -99,6 +109,7 @@ def build_flash_forward_candidates(
     input_ids: torch.Tensor,
     aliasing_guide: AliasingGuideTable,
     page_size: int,
+    min_candidate_tokens: int = 32,
 ) -> List[FlashForwardCandidate]:
     """
     Build flash-forward candidates from the aliasing guide.
@@ -106,6 +117,9 @@ def build_flash_forward_candidates(
     Each AliasEntry(src_page, dst_page, num_pages) indicates that the src block
     appears again at dst. The src block's tokens are candidates that may be
     regenerated during decode.
+
+    Only candidates with at least min_candidate_tokens are included to avoid
+    excessive overhead from many small candidates.
     """
     if aliasing_guide.empty:
         return []
@@ -121,6 +135,10 @@ def build_flash_forward_candidates(
             length = len(input_ids) - src_start
             if length <= 0:
                 continue
+
+        # Skip small candidates — overhead of detection outweighs benefit
+        if length < min_candidate_tokens:
+            continue
 
         tokens = input_ids[src_start : src_start + length].to(torch.int32)
         candidates.append(
@@ -225,8 +243,9 @@ def execute_flash_forward(
             dst_positions=dst_seq_positions,
         )
 
-    # 6. Mark KV as filled
-    req.cached_len = req.device_len
+    # 6. Mark KV as filled (except last token, which will be forwarded in next decode step)
+    # This ensures extend_len=1 for the next decode, maintaining the normal decode flow.
+    req.cached_len = req.device_len - 1
 
     # 7. Build DetokenizeMsg list
     ff_token_list = ff_tokens.tolist()

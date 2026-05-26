@@ -312,11 +312,6 @@ class Scheduler(SchedulerIOMixin):
             batch.input_ids = self.token_pool[input_mapping]
             forward_output = self.engine.forward_batch(batch, sample_args)
             self.token_pool[output_mapping] = forward_output.next_tokens_gpu
-            if batch.is_prefill:
-                apply_kv_aliasing(
-                    batch, self.engine.kv_cache, self.engine.page_table,
-                    self._cos_sin_cache, self.page_size,
-                )
             self.decode_manager.filter_reqs(forward_input.batch.reqs)
             return forward_output
         else:

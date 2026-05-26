@@ -22,7 +22,14 @@ _USE_FLASHINFER = None
 def _check_flashinfer():
     global _USE_FLASHINFER
     if _USE_FLASHINFER is None:
-        _USE_FLASHINFER = _can_use_flashinfer()
+        if not _can_use_flashinfer():
+            _USE_FLASHINFER = False
+            return False
+        try:
+            from flashinfer import silu_and_mul  # noqa: F401
+            _USE_FLASHINFER = True
+        except (ImportError, RuntimeError):
+            _USE_FLASHINFER = False
     return _USE_FLASHINFER
 
 

@@ -136,6 +136,91 @@ python -m minisgl --model "Qwen/Qwen3-0.6B" --shell
 
 You can also use `/reset` to clear the chat history.
 
+## Flash-Forward: Intra-Sequence KV Reuse for Repetitive Code Generation
+
+This fork extends Mini-SGLang with a three-phase optimization pipeline targeting **long-context SQL/code generation** where output contains repeated token blocks (e.g., `GROUP BY` mirroring `SELECT` fields).
+
+### Results
+
+| Metric | Flash-Forward | Baseline | Speedup |
+|--------|--------------|----------|---------|
+| Input tokens | 24,758 | 24,758 | — |
+| Output tokens | 16,384 | 16,384 | — |
+| Prefill (ms) | 55.2 | 47.8 | 0.87x |
+| Decode total (ms) | 145,377 | 223,596 | **1.54x** |
+| Decode ITI (ms/tok) | 8.87 | 13.65 | **1.54x** |
+| Total time (ms) | 145,432 | 223,643 | **1.54x** |
+| Throughput (tok/s) | 283 | 184 | **1.54x** |
+
+Environment: RTX 5090 (sm120), Qwen3-8B, page_size=1, flashinfer backend.
+
+### How It Works
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Phase 1: Pre-Prefill (CPU)                                     │
+│  Sliding-window hash → AliasingGuideTable (duplicate detection) │
+└──────────────────────────────┬──────────────────────────────────┘
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Phase 2: Prefill (GPU)                                         │
+│  Two-pass forward: skip duplicate suffix → KV page aliasing     │
+│  via copy_kv_with_rope (Triton fused kernel, 10.4x vs PyTorch)  │
+└──────────────────────────────┬──────────────────────────────────┘
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│  Phase 3: Decode (GPU)                                          │
+│  FlashForwardDetector (O(1) hash-map FSM) detects repeated      │
+│  output → bulk KV copy + token write → skip N autoregressive    │
+│  forward passes                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Key Files
+
+| File | Role |
+|------|------|
+| `python/minisgl/tokenizer/aliasing.py` | Sliding-window hash, builds `AliasingGuideTable` |
+| `python/minisgl/scheduler/kv_alias.py` | `compute_skippable_suffix()`, `apply_kv_aliasing()` |
+| `python/minisgl/scheduler/flash_forward.py` | FSM detector + `execute_flash_forward()` |
+| `python/minisgl/kernel/copy_kv_rope_triton.py` | Triton fused KV copy with RoPE correction |
+| `python/minisgl/kernel/copy_kv_rope.py` | PyTorch fallback for KV copy |
+| `benchmark/ab_benchmark.py` | A/B benchmark script |
+
+### Quick Start (Offline with Flash-Forward)
+
+```python
+import sys
+sys.path.insert(0, "/path/to/mini-sglang/python")
+
+from minisgl.llm import LLM
+from minisgl.core import SamplingParams
+
+llm = LLM(
+    model_path="Qwen/Qwen3-8B",
+    attention_backend="fi",
+    page_size=1,
+    cuda_graph_max_bs=0,
+)
+
+# Flash-forward is automatically enabled when input contains
+# intra-sequence duplicate blocks (detected via aliasing guide)
+results = llm.generate(
+    prompts=["<your long SQL prompt with repeated CASE WHEN blocks>"],
+    sampling_params=SamplingParams(max_tokens=16384, temperature=0.0),
+)
+```
+
+### Running the A/B Benchmark
+
+```bash
+python benchmark/ab_benchmark.py
+```
+
+Requires a baseline copy at `/root/autodl-tmp/mini-sglang-baseline`. Edit paths in the script as needed.
+
+---
+
 ## Benchmark
 
 ### Offline inference

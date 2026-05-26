@@ -12,6 +12,7 @@ from minisgl.message import (
     UserMsg,
 )
 from minisgl.scheduler import Scheduler, SchedulerConfig
+from minisgl.tokenizer.aliasing import build_aliasing_guide
 
 
 class RequestAllFinished(Exception):
@@ -56,7 +57,8 @@ class LLM(Scheduler):
             input_ids = self._tokenize_one(tokens_or_prompt)
             sum_input_len += len(input_ids)
             uid, added = self.counter + added, added + 1
-            results.append(UserMsg(uid=uid, input_ids=input_ids, sampling_params=sampling_params))
+            guide = build_aliasing_guide(input_ids, self.page_size)
+            results.append(UserMsg(uid=uid, input_ids=input_ids, sampling_params=sampling_params, aliasing_guide=guide))
             self.status_map[uid] = RequestStatus(
                 uid=uid,
                 input_ids=(

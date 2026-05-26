@@ -10,8 +10,13 @@ def _can_use_flashinfer_norm() -> bool:
     if not torch.cuda.is_available():
         return False
     cap = torch.cuda.get_device_capability()
-    # flashinfer requires sm75+
-    return cap[0] > 7 or (cap[0] == 7 and cap[1] >= 5)
+    if not (cap[0] > 7 or (cap[0] == 7 and cap[1] >= 5)):
+        return False
+    try:
+        from flashinfer import rmsnorm  # noqa: F401
+        return True
+    except (ImportError, RuntimeError):
+        return False
 
 
 def _torch_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:

@@ -24,6 +24,10 @@ class BaseAttnBackend(ABC):
     @abstractmethod
     def prepare_metadata(self, batch: Batch) -> None: ...
 
+    def prepare_metadata_pass2(self, batch: Batch) -> None:
+        """Prepare metadata for pass 2 of two-pass forward. Default: call prepare_metadata."""
+        self.prepare_metadata(batch)
+
     @abstractmethod
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None: ...
 
@@ -52,6 +56,10 @@ class HybridBackend(BaseAttnBackend):
     def prepare_metadata(self, batch: Batch) -> None:
         backend = self.prefill_backend if batch.is_prefill else self.decode_backend
         return backend.prepare_metadata(batch)
+
+    def prepare_metadata_pass2(self, batch: Batch) -> None:
+        backend = self.prefill_backend if batch.is_prefill else self.decode_backend
+        return backend.prepare_metadata_pass2(batch)
 
     def init_capture_graph(self, max_seq_len: int, bs_list: List[int]) -> None:
         self.decode_backend.init_capture_graph(max_seq_len, bs_list)
