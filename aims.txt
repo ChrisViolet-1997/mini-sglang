@@ -82,7 +82,54 @@
 
 ------
 
-## 四、 核心评估指标 (Metrics)
+## 五、 当前进度 (Progress)
+
+### 已完成
+
+- **硬件平台迁移：V100 → RTX 5090 (sm120/Blackwell)**
+  - 升级 PyTorch 至 2.9.1+cu129，支持 sm120 架构
+  - 从源码编译 flash-attn（`TORCH_CUDA_ARCH_LIST="12.0"`）
+  - 修补 flashinfer JIT 编译链路（`get_cuda_version` 取 nvcc/torch 最大值，移除 `compute_120f` 后缀兼容 nvcc 12.8）
+
+- **阶段 2 核心实现：页表别名化（Page Aliasing）**
+  - `python/minisgl/scheduler/kv_alias.py`：实现 `compute_skippable_suffix()` 和 `apply_kv_aliasing()`
+  - `python/minisgl/kernel/copy_kv_rope.py`：纯 PyTorch 实现 KV 拷贝 + RoPE 差分旋转
+
+- **阶段 3 基础设施：sm120 注意力后端**
+  - `python/minisgl/attention/fa.py`：用 gather + `flash_attn_varlen_func` 替换 sgl_kernel 依赖，支持 page_size=1
+  - `python/minisgl/layers/rotary.py`：修复 flashinfer RoPE 在 sm120 上的可用性检测
+
+- **端到端推理验证**
+  - Qwen3 模型加载成功（`/root/autodl-tmp/local_llm/dir`）
+  - 短 prompt（"你是谁"）推理正确，输出连贯中文
+  - 长 prompt（95616 字符 demo）成功生成 4096 tokens
+
+### 进行中 / 下一步 TODO
+
+**P0 — Decode 热路径优化（每个 token 都经过）**
+
+- [ ] `fa.py`：用 flashinfer `BatchDecodeWithPagedKVCacheWrapper` 替代 decode 阶段的 Python loop + gather + `flash_attn_varlen_func`。flashinfer paged decode 原生支持 page_size=1，且 JIT 已在 sm120 上修通。预期消除 decode 阶段的中间显存拷贝和 Python 循环开销。
+
+**P1 — 验证 flashinfer JIT 在 sm120 上的各算子可用性**
+
+- [ ] `activation.py`：`_can_use_flashinfer()` 的 capability check 通过（12 > 7），但需上 GPU 验证 `flashinfer.silu_and_mul` JIT 编译是否正常。若失败需加 try/except 保护。
+- [ ] `norm.py`：同上，验证 `flashinfer.rmsnorm` / `flashinfer.fused_add_rmsnorm` 在 sm120 上 JIT 编译正常。
+- [ ] `rotary.py`：验证 `TARGET_CUDA_ARCHS` 在 flashinfer 修补后是否已正确填充 sm120，确认 RoPE 走 kernel 路径而非 PyTorch fallback。
+
+**P2 — Flash-Forward 内核优化**
+
+- [ ] `copy_kv_rope_triton.py`：已编写 Triton fused kernel（KV copy + 差分 RoPE），需上 GPU 验证正确性和性能。预期相比纯 PyTorch 版本减少中间 tensor 分配和 kernel launch 开销。
+- [ ] `fa.py` prefill 路径：当前 gather 在 prefill 也有开销（但只跑一次），若 flashinfer prefill 也支持 paged KV 可一并替换。
+
+**P3 — 功能完善**
+
+- [ ] 阶段 1：Prefill 前置期的字面量压缩与跨位置重复打标（`AliasingGuideTable`）
+- [ ] 阶段 3：语法状态机位图下沉 + Flash-Forward 快进调度逻辑
+- [ ] 性能基准测试与指标量化（TTFT / ITI / QPS / 显存曲线）
+
+------
+
+## 六、 核心评估指标 (Metrics)
 
 Claude Code 完成重构后，系统需要跑通并量化以下三个硬核指标：
 

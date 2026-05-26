@@ -11,7 +11,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-from minisgl.kernel.copy_kv_rope import copy_kv_with_rope
+try:
+    from minisgl.kernel.copy_kv_rope_triton import copy_kv_with_rope
+except ImportError:
+    from minisgl.kernel.copy_kv_rope import copy_kv_with_rope
 
 if TYPE_CHECKING:
     from minisgl.core import Batch, Req

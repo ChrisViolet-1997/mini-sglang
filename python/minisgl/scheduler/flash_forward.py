@@ -12,7 +12,10 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
-from minisgl.kernel.copy_kv_rope import copy_kv_with_rope
+try:
+    from minisgl.kernel.copy_kv_rope_triton import copy_kv_with_rope
+except ImportError:
+    from minisgl.kernel.copy_kv_rope import copy_kv_with_rope
 from minisgl.message import DetokenizeMsg
 
 if TYPE_CHECKING:
